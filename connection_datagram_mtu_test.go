@@ -63,3 +63,56 @@ func TestConnectionDatagramBudgetOnLocalMigration(t *testing.T) {
 	defer c.sendQueue.Close()
 	require.Equal(t, uint32(initialMTU), c.currentPacketMTU.Load())
 }
+
+func TestConnectionDatagramPayloadLimit(t *testing.T) {
+	tc := newServerTestConnection(t, nil, &Config{EnableDatagrams: true, InitialPacketSize: 1200}, false)
+	c := tc.conn
+	for _, cidLen := range []int{0, 4, 8, 20} {
+		c.connIDManager = newConnIDManager(protocol.ParseConnectionID(make([]byte, cidLen)), nil, nil, nil)
+		for _, packetMTU := range []uint32{1200, 1452} {
+			c.currentPacketMTU.Store(packetMTU)
+			for _, peerMax := range []protocol.ByteCount{0, 100, 65535} {
+				c.peerParams = &wire.TransportParameters{MaxDatagramFrameSize: peerMax}
+				limit := c.DatagramPayloadLimit()
+				if peerMax == 0 {
+					require.Zero(t, limit)
+					continue
+				}
+				var tooLarge *DatagramTooLargeError
+				require.ErrorAs(t, c.SendDatagram(make([]byte, int(limit)+1)), &tooLarge)
+				require.Equal(t, limit, tooLarge.MaxDatagramPayloadSize)
+				payload := make([]byte, int(limit))
+				frame := &wire.DatagramFrame{Data: payload, DataLenPresent: true}
+				require.LessOrEqual(t, frame.Length(c.version), peerMax)
+				packetLen := wire.ShortHeaderLen(c.connIDManager.Get(), protocol.PacketNumberLen4) + frame.Length(c.version) + 16
+				require.LessOrEqual(t, packetLen, protocol.ByteCount(packetMTU))
+				require.NoError(t, c.SendDatagram(payload))
+				c.datagramQueue.Pop()
+			}
+		}
+	}
+}
+
+func TestConnectionDatagramPayloadLimitConcurrentCIDUpdates(t *testing.T) {
+	tc := newServerTestConnection(t, nil, &Config{EnableDatagrams: true}, false)
+	c := tc.conn
+	c.peerParams = &wire.TransportParameters{MaxDatagramFrameSize: 65535}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			c.DatagramPayloadLimit()
+		}
+	}()
+	for range 100 {
+		for cidLen := 1; cidLen <= 20; cidLen++ {
+			c.connIDManager.ChangeInitialConnID(protocol.ParseConnectionID(make([]byte, cidLen)))
+		}
+	}
+	<-done
+	longCIDLimit := c.DatagramPayloadLimit()
+	c.connIDManager.ChangeInitialConnID(protocol.ParseConnectionID(make([]byte, 4)))
+	require.Equal(t, longCIDLimit, c.DatagramPayloadLimit(), "retain the budget for every known peer CID")
+	require.NoError(t, c.connIDManager.AddFromPreferredAddress(protocol.ParseConnectionID(make([]byte, 20)), protocol.StatelessResetToken{}))
+	require.Equal(t, longCIDLimit, c.DatagramPayloadLimit())
+}

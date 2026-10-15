@@ -3028,7 +3028,7 @@ func (c *Conn) SendDatagram(p []byte) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
-	maxDataLen := c.datagramPayloadLimit()
+	maxDataLen := c.DatagramPayloadLimit()
 	if int64(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: maxDataLen}
 	}
@@ -3037,8 +3037,11 @@ func (c *Conn) SendDatagram(p []byte) error {
 	return c.datagramQueue.Add(f)
 }
 
-// datagramPayloadLimit reserves packet and DATAGRAM framing from the current packet MTU.
-func (c *Conn) datagramPayloadLimit() int64 {
+// DatagramPayloadLimit returns the conservative payload limit currently used by
+// SendDatagram. Call only after the handshake completes. The limit is zero if the
+// peer did not negotiate datagrams. It can change with MTU discovery, connection
+// IDs and path migration; reading it does not reserve space in the send queue.
+func (c *Conn) DatagramPayloadLimit() int64 {
 	f := &wire.DatagramFrame{DataLenPresent: true}
 	// Reserve short-header flags, every known peer CID, the largest packet
 	// number, AEAD tag and DATAGRAM framing. MTU stores packet bytes throughout.
